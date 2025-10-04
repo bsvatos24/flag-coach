@@ -656,7 +656,11 @@ export default function App() {
 
     if (which === "Offense") {
       const mapping = {};
-      for (const r of OFFENSE_ROLES) {
+      const prioritizedRoles = [
+        ...["off_qb", "off_c"].filter((role) => OFFENSE_ROLES.includes(role)),
+        ...OFFENSE_ROLES.filter((role) => role !== "off_qb" && role !== "off_c"),
+      ];
+      for (const r of prioritizedRoles) {
         const id = pickForRole(r, playIds, assigned, currentSeries);
         if (id) { mapping[r] = id; assigned.add(id); }
       }
@@ -762,10 +766,9 @@ export default function App() {
                   return (
                     <div
                       key={`empty-${rowIndex}-${slotIndex}`}
-                      className="flex items-center justify-center rounded-xl border border-dashed border-white/10 text-xs text-gray-500"
-                    >
-                      None
-                    </div>
+                      className="min-h-[72px]"
+                      aria-hidden="true"
+                    />
                   );
                 }
 
@@ -1032,15 +1035,33 @@ export default function App() {
                     <span>{p.name}</span>
                   </label>
                   <div className="flex flex-wrap items-center gap-3 text-xs sm:text-sm">
-                    <div className="flex items-center gap-3">
-                      <label className="flex items-center gap-1">
-                        <input type="checkbox" className="h-4 w-4" checked={!!p.canQB} onChange={() => toggleAbilityFlag(p.id, "canQB")} />
-                        <span>QB ok</span>
-                      </label>
-                      <label className="flex items-center gap-1">
-                        <input type="checkbox" className="h-4 w-4" checked={!!p.canCenter} onChange={() => toggleAbilityFlag(p.id, "canCenter")} />
-                        <span>C ok</span>
-                      </label>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        aria-pressed={!!p.canQB}
+                        onClick={() => toggleAbilityFlag(p.id, "canQB")}
+                        className={`flex items-center gap-1 rounded-lg border px-2 py-1 font-semibold uppercase tracking-wide transition focus:outline-none focus:ring-2 focus:ring-white/40 focus:ring-offset-2 focus:ring-offset-gray-900 ${
+                          p.canQB
+                            ? "border-emerald-400/60 bg-emerald-500/20 text-emerald-100"
+                            : "border-red-400/60 bg-red-500/10 text-red-200"
+                        }`}
+                      >
+                        <span className="text-base leading-none">{p.canQB ? "✓" : "✕"}</span>
+                        <span>QB</span>
+                      </button>
+                      <button
+                        type="button"
+                        aria-pressed={!!p.canCenter}
+                        onClick={() => toggleAbilityFlag(p.id, "canCenter")}
+                        className={`flex items-center gap-1 rounded-lg border px-2 py-1 font-semibold uppercase tracking-wide transition focus:outline-none focus:ring-2 focus:ring-white/40 focus:ring-offset-2 focus:ring-offset-gray-900 ${
+                          p.canCenter
+                            ? "border-emerald-400/60 bg-emerald-500/20 text-emerald-100"
+                            : "border-red-400/60 bg-red-500/10 text-red-200"
+                        }`}
+                      >
+                        <span className="text-base leading-none">{p.canCenter ? "✓" : "✕"}</span>
+                        <span>C</span>
+                      </button>
                     </div>
                     <span>Capt: {p.captains || 0}</span>                  
                     <button className="rounded-lg border border-white/30 bg-white/10 px-2 py-1" onClick={() => removePlayer(p.id)}>remove</button>
