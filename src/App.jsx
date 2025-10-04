@@ -5,7 +5,7 @@ import React, { useEffect, useMemo, useState } from "react";
  * -----------------------------------------------------------------------
  * Highlights:
  * 1) Positions are random-balanced per game with no immediate repeats inside the same role family.
- * 2) Captains are selected at random (IOUs are still served first) so every draw is unpredictable.
+ * 2) Captains are selected with balanced counts across the remaining games.
  * 3) Attendance modal lets you toggle QB and Center eligibility for each player.
  * 4) Offense formation: QB, RB1, RB2, C, WR, TE1, TE2. (Defense unchanged.)
  * 5) Dark, phone-friendly UI with a sticky bottom bar.
@@ -38,7 +38,23 @@ function roleGroup(role) {
   return role.replace(/\d+$/, "");
 }
 
-const LS_KEY = "ffb-rotation-state-v6";
+const LS_KEY = "ffb-rotation-state-v7";
+const DEFAULT_CAPTAIN_GAMES = 3;
+
+function calculateCaptainGroups(playerCount, gamesRemaining) {
+  const games = Math.max(1, gamesRemaining || DEFAULT_CAPTAIN_GAMES);
+  if (playerCount <= 0) return [];
+  const base = Math.floor(playerCount / games);
+  const remainder = playerCount % games;
+  const groups = new Array(games).fill(base);
+  for (let i = 0; i < remainder; i++) {
+    const idx = groups.length - 1 - i;
+    if (idx >= 0) {
+      groups[idx] += 1;
+    }
+  }
+  return groups.filter((size) => size > 0);
+}
 
 // ---------- Helpers ----------
 function createEmptyTallies(name) {
@@ -127,8 +143,9 @@ function loadInitialState() {
     captainPlan: {
       seasonTargetTotal: baseRoster.length * 2,
       recentPicks: [],
+      gamesRemaining: DEFAULT_CAPTAIN_GAMES,
+      nextGroupIndex: 0,
     },
-    captainIOUs: [],
     lastQB: null,
     gameNumber: 1,
     seasonHistory: [],
@@ -155,8 +172,13 @@ function loadInitialState() {
           ...baseState.captainPlan,
           ...(restData.captainPlan || {}),
           seasonTargetTotal: (restData.captainPlan && restData.captainPlan.seasonTargetTotal) || storedRoster.length * 2 || baseRoster.length * 2,
+          gamesRemaining: (restData.captainPlan && restData.captainPlan.gamesRemaining !== undefined)
+            ? restData.captainPlan.gamesRemaining
+            : baseState.captainPlan.gamesRemaining,
+          nextGroupIndex: (restData.captainPlan && restData.captainPlan.nextGroupIndex !== undefined)
+            ? restData.captainPlan.nextGroupIndex
+            : 0,
         },
-        captainIOUs: restData.captainIOUs || [],
         history: restData.history || [],
         recentRoleByPlayer: normalizedRecent,
         seasonHistory: restData.seasonHistory || [],
@@ -171,7 +193,7 @@ export default function App() {
   const [state, setState] = useState(loadInitialState);
   const {
     roster, queue, series, history, settings, recentRoleByPlayer,
-    captainPlan, captainIOUs,
+    captainPlan,
     gameNumber, seasonHistory, ui,
   } = state;
 
@@ -179,6 +201,13 @@ export default function App() {
   const activePlayers = useMemo(() => roster.filter((p) => p.active), [roster]);
   const totalActive = activePlayers.length;
   const sitCount = Math.max(totalActive - settings.teamSize, 0);
+  const captainGroups = useMemo(
+    () => calculateCaptainGroups(totalActive, captainPlan?.gamesRemaining || DEFAULT_CAPTAIN_GAMES),
+    [totalActive, captainPlan?.gamesRemaining],
+  );
+  const nextCaptainGroupSize = captainGroups.length
+    ? captainGroups[Math.min(captainPlan?.nextGroupIndex || 0, captainGroups.length - 1)]
+    : 0;
 
   // Persist
   useEffect(() => {
@@ -229,6 +258,7 @@ export default function App() {
       lastQB: null,
       gameNumber: (gameNumber || 1) + 1,
       seasonHistory: [...(seasonHistory || []), summary],
+      captainPlan: { ...s.captainPlan, recentPicks: [] },
     }));
   }
 
@@ -265,7 +295,13 @@ export default function App() {
       const newPlayer = createEmptyTallies(name);
       const roster = exists ? s.roster : [...s.roster, newPlayer].sort((a, b) => a.name.localeCompare(b.name));
       const queue = roster.filter((p) => p.active).map((p) => p.id);
-      const captainPlan = { ...s.captainPlan, seasonTargetTotal: roster.length * 2 };
+      const activeCount = roster.filter((p) => p.active).length;
+      const groups = calculateCaptainGroups(activeCount, s.captainPlan?.gamesRemaining || DEFAULT_CAPTAIN_GAMES);
+      const captainPlan = {
+        ...s.captainPlan,
+        seasonTargetTotal: roster.length * 2,
+        nextGroupIndex: Math.min(s.captainPlan?.nextGroupIndex || 0, Math.max(groups.length - 1, 0)),
+      };
       return { ...s, roster, queue, captainPlan };
     });
   }
@@ -273,26 +309,28 @@ export default function App() {
     setState((s) => {
       const roster = s.roster.filter((p) => p.id !== id);
       const queue = s.queue.filter((q) => q !== id);
-      const captainPlan = { ...s.captainPlan, seasonTargetTotal: roster.length * 2 };
+      const activeCount = roster.filter((p) => p.active).length;
+      const groups = calculateCaptainGroups(activeCount, s.captainPlan?.gamesRemaining || DEFAULT_CAPTAIN_GAMES);
+      const captainPlan = {
+        ...s.captainPlan,
+        seasonTargetTotal: roster.length * 2,
+        nextGroupIndex: Math.min(s.captainPlan?.nextGroupIndex || 0, Math.max(groups.length - 1, 0)),
+      };
       const recentRoleByPlayer = Object.fromEntries(Object.entries(s.recentRoleByPlayer || {}).filter(([pid]) => pid !== id));
-      const captainIOUs = (s.captainIOUs || []).filter((pid) => pid !== id);
-      return { ...s, roster, queue, captainPlan, recentRoleByPlayer, captainIOUs };
+      return { ...s, roster, queue, captainPlan, recentRoleByPlayer };
     });
   }
   function toggleActive(id) {
     setState((s) => {
       const roster = s.roster.map((p) => (p.id === id ? { ...p, active: !p.active } : p));
       const queue = roster.filter((p) => p.active).map((p) => p.id);
-      return { ...s, roster, queue };
-    });
-  }
-
-  // ---------- Captains (alphabetical queue + IOUs) ----------
-  function toggleCaptainIOU(id) {
-    setState((s) => {
-      const set = new Set(s.captainIOUs || []);
-      if (set.has(id)) set.delete(id); else set.add(id);
-      return { ...s, captainIOUs: Array.from(set) };
+      const activeCount = roster.filter((p) => p.active).length;
+      const groups = calculateCaptainGroups(activeCount, s.captainPlan?.gamesRemaining || DEFAULT_CAPTAIN_GAMES);
+      const captainPlan = {
+        ...s.captainPlan,
+        nextGroupIndex: Math.min(s.captainPlan?.nextGroupIndex || 0, Math.max(groups.length - 1, 0)),
+      };
+      return { ...s, roster, queue, captainPlan };
     });
   }
 
@@ -303,38 +341,50 @@ export default function App() {
     }));
   }
 
-   function pickRandomCaptains(targetCount = 2) {
-    const presentIds = activePlayers.map((p) => p.id);
-    if (!presentIds.length) return;
+   // ---------- Captains (balanced groups) ----------
+  function pickNextCaptains() {
+    setState((s) => {
+      const activePlayersState = s.roster.filter((p) => p.active);
+      if (!activePlayersState.length) return s;
 
-    const picks = [];
-    const owed = (captainIOUs || []).filter((id) => presentIds.includes(id));
-    rngShuffle(owed).forEach((id) => {
-      if (picks.length < targetCount && !picks.includes(id)) {
-        picks.push(id);
-      }
-    });
+      const groups = calculateCaptainGroups(
+        activePlayersState.length,
+        s.captainPlan?.gamesRemaining || DEFAULT_CAPTAIN_GAMES,
+      );
+      if (!groups.length) return s;
 
-    if (picks.length < targetCount) {
-      const remainingPool = presentIds.filter((id) => !picks.includes(id));
-      rngShuffle(remainingPool).forEach((id) => {
-        if (picks.length < targetCount) {
-          picks.push(id);
-        }
+      const currentIndex = Math.min(s.captainPlan?.nextGroupIndex || 0, groups.length - 1);
+      const targetCount = groups[currentIndex] || 0;
+      if (!targetCount) return s;
+
+      const shuffled = rngShuffle(activePlayersState);
+      shuffled.sort((a, b) => {
+        const diff = (a.captains || 0) - (b.captains || 0);
+        if (diff) return diff;
+        return a.name.localeCompare(b.name);
       });
-    }
 
-    if (!picks.length) return;
+    const picks = shuffled.slice(0, targetCount).map((p) => p.id);
+      if (!picks.length) return s;
 
-    const updated = roster.map((p) => (picks.includes(p.id) ? { ...p, captains: (p.captains || 0) + 1 } : p));
-    const remainingIOUs = (captainIOUs || []).filter((id) => !picks.includes(id));
+    const updatedRoster = s.roster.map((p) => (
+        picks.includes(p.id)
+          ? { ...p, captains: (p.captains || 0) + 1 }
+          : p
+      ));
 
-    setState((s) => ({
-      ...s,
-      roster: updated,
-      captainPlan: { ...s.captainPlan, recentPicks: picks },
-      captainIOUs: remainingIOUs,
-    }));
+    const nextIndex = Math.min(currentIndex + 1, Math.max(groups.length - 1, 0));
+
+      return {
+        ...s,
+        roster: updatedRoster,
+        captainPlan: {
+          ...s.captainPlan,
+          recentPicks: picks,
+          nextGroupIndex: nextIndex,
+        },
+      };
+    });
   }
 
   // ---------- Position assignment engine (random + balanced per game) ----------
@@ -552,11 +602,19 @@ export default function App() {
             <div className="text-sm">Used <b>{captainUsed}</b> / Target <b>{captainPlan.seasonTargetTotal}</b> • Rem <b>{captainNeeded}</b></div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <button className="rounded-2xl border border-white/30 hover:border-white/60 bg-white/5 px-4 py-2" onClick={() => pickRandomCaptains(2)}>Pick 2 (Random)</button>
+           <button
+              className="rounded-2xl border border-white/30 hover:border-white/60 bg-white/5 px-4 py-2 disabled:opacity-50 disabled:hover:border-white/30"
+              onClick={pickNextCaptains}
+              disabled={!nextCaptainGroupSize}>
+              {nextCaptainGroupSize ? `Pick Next Captains (${nextCaptainGroupSize})` : "Pick Next Captains"}
+            </button>
             {captainPlan.recentPicks?.length ? (
               <div className="text-sm">Picked: {captainPlan.recentPicks.map((id) => byId.get(id)?.name).filter(Boolean).join(", ")}</div>
             ) : (<div className="text-sm text-gray-300">(no picks yet)</div>)}
-          </div>          
+          </div>
+          <div className="mt-2 text-xs text-gray-300">
+            Plan: {captainGroups.length ? captainGroups.join(" • ") : "--"} captains over {captainGroups.length || 0} game{captainGroups.length === 1 ? "" : "s"} • Games left setting: {captainPlan.gamesRemaining || DEFAULT_CAPTAIN_GAMES}
+          </div>         
         </section>
 
         {/* Tally Board (mobile scroll) */}
@@ -609,7 +667,7 @@ export default function App() {
             <summary className="cursor-pointer font-medium">Notes (tap)</summary>
               <ul className="mt-2 list-disc space-y-1 pl-5">
                 <li>Positions are random-balanced per game: prefer 0-count, otherwise minimum count; tie-break random.</li>
-                <li>Captains are random draws with IOUs served first. Use IOU toggle if someone misses their turn.</li>
+                <li>Captains are balanced: lowest totals are picked first using the remaining-games plan (3 • 3 • 4 by default).</li>
                 <li>Start New Game clears **all positions & sits** but keeps captain counts.</li>
               </ul>
           </details>
@@ -656,13 +714,7 @@ export default function App() {
                         <span>C ok</span>
                       </label>
                     </div>
-                    <span>Capt: {p.captains || 0}</span>
-                    <button
-                      className={`rounded-lg border px-2 py-1 ${ (captainIOUs||[]).includes(p.id) ? 'border-white/60 bg-white/20' : 'border-white/30 bg-white/10' }`}
-                      onClick={() => toggleCaptainIOU(p.id)}
-                      title="Mark captain IOU">
-                      IOU
-                    </button>
+                    <span>Capt: {p.captains || 0}</span>                  
                     <button className="rounded-lg border border-white/30 bg-white/10 px-2 py-1" onClick={() => removePlayer(p.id)}>remove</button>
                   </div>
                 </div>
@@ -690,6 +742,30 @@ export default function App() {
                 <span className="text-sm">No repeat same role in last 1 series</span>
                 <input type="checkbox" className="h-5 w-5" checked={!!settings.noRepeatWindow}
                   onChange={()=>setState((s)=>({...s, settings:{...s.settings, noRepeatWindow: s.settings.noRepeatWindow ? 0 : 1}}))} />
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-sm">Captain games remaining</span>
+                <input
+                  type="number"
+                  className="w-20 rounded border border-white/20 bg-transparent px-2 py-1"
+                  value={captainPlan.gamesRemaining || DEFAULT_CAPTAIN_GAMES}
+                  min={1}
+                  onChange={(e) => {
+                    const value = Math.max(1, Math.floor(+e.target.value || DEFAULT_CAPTAIN_GAMES));
+                    setState((s) => {
+                      const activeCount = s.roster.filter((p) => p.active).length;
+                      const groups = calculateCaptainGroups(activeCount, value);
+                      return {
+                        ...s,
+                        captainPlan: {
+                          ...s.captainPlan,
+                          gamesRemaining: value,
+                          nextGroupIndex: Math.min(s.captainPlan?.nextGroupIndex || 0, Math.max(groups.length - 1, 0)),
+                        },
+                      };
+                    });
+                  }}
+                />
               </div>
             </div>
           </div>
