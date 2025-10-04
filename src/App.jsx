@@ -1,21 +1,12 @@
 import React, { useEffect, useMemo, useState } from "react";
 
 /**
- * 7v7 Flag Football Coach – Mobile-first + Random-Balanced Positions + Captain Queue (v6)
- * --------------------------------------------------------------------------------------
- * What’s new in this version:
- * 1) Positions are **random + balanced** per game:
- *    - Prefer players who have **NOT** played that role yet **this game** (pos[role] === 0).
- *    - If everyone has, pick from the **lowest per-game count** for that role.
- *    - Tie-break by **true random** (no alphabetical fallback).
- *    - Also keeps optional safeguard: **no repeat same role in back-to-back series**.
- * 2) Captains flow = **alphabetical queue** with IOUs:
- *    - Maintains a persistent alphabetical **captainQueue** + pointer (**captainIndex**).
- *    - **Captain IOUs** list to give missed turns priority next time (e.g., Barrett).
- *    - "Pick 2" pulls IOUs first (present players), then continues round-robin in alphabetical order.
- * 3) Between games: **clear everything except captains**.
- *    - "Start New Game" resets series, sits, **and all per-game position counts** to 0.
- *    - Captains tallies + captain queue stay.
+ * 7v7 Flag Football Coach – Mobile-first + Random-Balanced Positions (v7)
+ * -----------------------------------------------------------------------
+ * Highlights:
+ * 1) Positions are random-balanced per game with no immediate repeats inside the same role family.
+ * 2) Captains are selected at random (IOUs are still served first) so every draw is unpredictable.
+ * 3) Attendance modal lets you toggle QB and Center eligibility for each player.
  * 4) Offense formation: QB, RB1, RB2, C, WR, TE1, TE2. (Defense unchanged.)
  * 5) Dark, phone-friendly UI with a sticky bottom bar.
  */
@@ -37,18 +28,32 @@ const DEFAULT_ROSTER = [
 const OFFENSE_ROLES = ["QB", "RB1", "RB2", "C", "WR", "TE1", "TE2"];
 const DEFENSE_ROLES = ["DT", "DE1", "DE2", "CB1", "CB2", "Spy", "Blitzer"];
 
+const ROLE_ABILITY_CHECK = {
+  QB: (player) => player.canQB !== false,
+  C: (player) => player.canCenter !== false,
+};
+
+function roleGroup(role) {
+  if (!role) return role;
+  return role.replace(/\d+$/, "");
+}
+
 const LS_KEY = "ffb-rotation-state-v6";
 
 // ---------- Helpers ----------
 function createEmptyTallies(name) {
   const pos = {};
   [...OFFENSE_ROLES, ...DEFENSE_ROLES].forEach((r) => (pos[r] = 0));
-  return { name, active: true, sits: 0, captains: 0, pos, id: crypto.randomUUID() };
-}
-function rngPick(arr) {
-  if (!arr.length) return undefined;
-  const idx = crypto.getRandomValues(new Uint32Array(1))[0] % arr.length;
-  return arr[idx];
+  return {
+    name,
+    active: true,
+    sits: 0,
+    captains: 0,
+    pos,
+    id: crypto.randomUUID(),
+    canQB: true,
+    canCenter: true,
+  };
 }
 function rngShuffle(arr) {
   const a = [...arr];
@@ -62,50 +67,111 @@ function rngShuffle(arr) {
 // Build a fresh roster: positions zeroed; seed captain counts (season-to-date)
 function buildInitialRoster() {
   const roster = DEFAULT_ROSTER.map((n) => createEmptyTallies(n)).sort((a, b) => a.name.localeCompare(b.name));
-  const seedCaptains = new Set(["Niko", "Sully", "CJ", "Elijah", "Jeremiah"]); // add this week’s captains
-  return roster.map((p) => ({ ...p, captains: seedCaptains.has(p.name) ? 1 : 0 }));
+  return roster;
+}
+
+function normalizePlayer(player) {
+  if (!player) return player;
+  const normalized = { ...player };
+
+  const pos = { ...(normalized.pos || {}) };
+  [...OFFENSE_ROLES, ...DEFENSE_ROLES].forEach((role) => {
+    pos[role] = typeof pos[role] === "number" ? pos[role] : 0;
+  });
+  normalized.pos = pos;
+
+  const hadAbilityFlags = Object.prototype.hasOwnProperty.call(player, "canQB") ||
+    Object.prototype.hasOwnProperty.call(player, "canCenter");
+
+  normalized.canQB = player.canQB !== undefined ? player.canQB : true;
+  normalized.canCenter = player.canCenter !== undefined ? player.canCenter : true;
+
+  normalized.captains = typeof player.captains === "number" ? player.captains : 0;
+  if (!hadAbilityFlags) {
+    normalized.captains = 0;
+  }
+
+  normalized.sits = typeof player.sits === "number" ? player.sits : 0;
+  normalized.active = player.active !== undefined ? player.active : true;
+
+  return normalized;
+}
+
+function normalizeRecentMap(map) {
+  if (!map) return {};
+  const result = {};
+  Object.entries(map).forEach(([pid, rec]) => {
+    if (!rec) return;
+    result[pid] = {
+      role: roleGroup(rec.role),
+      series: rec.series || 0,
+    };
+  });
+  return result;
 }
 
 function loadInitialState() {
-  try {
-    const raw = localStorage.getItem(LS_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {}
-
-  const roster = buildInitialRoster();
-  const captainQueue = roster.map((p) => p.id); // alphabetical order by default
-  return {
-    roster,
-    queue: roster.map((p) => p.id),
+  const baseRoster = buildInitialRoster().map((p) => normalizePlayer(p));
+  const baseSettings = {
+    teamSize: 7,
+    noRepeatWindow: 1, // block same role in consecutive series
+    assignment: "randBalanced", // random among balanced group
+  };
+  const baseState = {
+    roster: baseRoster,
+    queue: baseRoster.map((p) => p.id),
     series: 0,
     history: [],
-    settings: {
-      teamSize: 7,
-      noRepeatWindow: 1, // block same role in consecutive series
-      assignment: 'randBalanced', // random among balanced group
-    },
-    recentRoleByPlayer: {}, // { [playerId]: { role, series } }
+    settings: baseSettings,
+    recentRoleByPlayer: {},
     captainPlan: {
-      seasonTargetTotal: roster.length * 2,
+      seasonTargetTotal: baseRoster.length * 2,
       recentPicks: [],
     },
-    // Captain queue state
-    captainQueue,      // array of ids in alphabetical order
-    captainIndex: 0,   // pointer into captainQueue
-    captainIOUs: [],   // ids owed a captain turn
-
+    captainIOUs: [],
     lastQB: null,
     gameNumber: 1,
     seasonHistory: [],
     ui: { showAttendance: false, showSettings: false },
   };
+
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (raw) {
+      const data = JSON.parse(raw);
+      const { captainQueue: _discardQueue, captainIndex: _discardIndex, ...restData } = data || {};
+      const storedRoster = (restData.roster || []).map((p) => normalizePlayer(p));
+      const activeIds = storedRoster.filter((p) => p.active).map((p) => p.id);
+      const storedQueue = (restData.queue || []).filter((id) => activeIds.includes(id));
+      const queueTail = activeIds.filter((id) => !storedQueue.includes(id));
+      const normalizedRecent = normalizeRecentMap(restData.recentRoleByPlayer);
+      return {
+        ...baseState,
+        ...restData,
+        roster: storedRoster.length ? storedRoster : baseRoster,
+        queue: [...storedQueue, ...queueTail].length ? [...storedQueue, ...queueTail] : baseState.queue,
+        settings: { ...baseSettings, ...(restData.settings || {}) },
+        captainPlan: {
+          ...baseState.captainPlan,
+          ...(restData.captainPlan || {}),
+          seasonTargetTotal: (restData.captainPlan && restData.captainPlan.seasonTargetTotal) || storedRoster.length * 2 || baseRoster.length * 2,
+        },
+        captainIOUs: restData.captainIOUs || [],
+        history: restData.history || [],
+        recentRoleByPlayer: normalizedRecent,
+        seasonHistory: restData.seasonHistory || [],
+      };
+    }
+  } catch {}
+
+  return baseState;
 }
 
 export default function App() {
   const [state, setState] = useState(loadInitialState);
   const {
     roster, queue, series, history, settings, recentRoleByPlayer,
-    captainPlan, captainQueue, captainIndex, captainIOUs,
+    captainPlan, captainIOUs,
     gameNumber, seasonHistory, ui,
   } = state;
 
@@ -200,10 +266,7 @@ export default function App() {
       const roster = exists ? s.roster : [...s.roster, newPlayer].sort((a, b) => a.name.localeCompare(b.name));
       const queue = roster.filter((p) => p.active).map((p) => p.id);
       const captainPlan = { ...s.captainPlan, seasonTargetTotal: roster.length * 2 };
-      // Rebuild captainQueue alphabetically, and reposition pointer by name continuity
-      const captainQueue = roster.map((p) => p.id);
-      const captainIndex = 0; // simple reset; can be enhanced to preserve pointer
-      return { ...s, roster, queue, captainPlan, captainQueue, captainIndex };
+      return { ...s, roster, queue, captainPlan };
     });
   }
   function removePlayer(id) {
@@ -212,10 +275,8 @@ export default function App() {
       const queue = s.queue.filter((q) => q !== id);
       const captainPlan = { ...s.captainPlan, seasonTargetTotal: roster.length * 2 };
       const recentRoleByPlayer = Object.fromEntries(Object.entries(s.recentRoleByPlayer || {}).filter(([pid]) => pid !== id));
-      const captainQueue = roster.map((p) => p.id);
-      let captainIndex = s.captainIndex % Math.max(1, captainQueue.length);
       const captainIOUs = (s.captainIOUs || []).filter((pid) => pid !== id);
-      return { ...s, roster, queue, captainPlan, recentRoleByPlayer, captainQueue, captainIndex, captainIOUs };
+      return { ...s, roster, queue, captainPlan, recentRoleByPlayer, captainIOUs };
     });
   }
   function toggleActive(id) {
@@ -235,59 +296,75 @@ export default function App() {
     });
   }
 
-  function pickCaptainsAlphabetical(targetCount = 2) {
-    const present = new Set(activePlayers.map((p) => p.id));
-    const picks = [];
+  function toggleAbilityFlag(id, key) {
+    setState((s) => ({
+      ...s,
+      roster: s.roster.map((p) => (p.id === id ? { ...p, [key]: !p[key] } : p)),
+    }));
+  }
 
-    // Step 1: serve IOUs first, in captainQueue order
-    for (const id of captainQueue) {
-      if (picks.length >= targetCount) break;
-      if (present.has(id) && (captainIOUs || []).includes(id) && !picks.includes(id)) {
+   function pickRandomCaptains(targetCount = 2) {
+    const presentIds = activePlayers.map((p) => p.id);
+    if (!presentIds.length) return;
+
+    const picks = [];
+    const owed = (captainIOUs || []).filter((id) => presentIds.includes(id));
+    rngShuffle(owed).forEach((id) => {
+      if (picks.length < targetCount && !picks.includes(id)) {
         picks.push(id);
       }
-    }
+    });
 
-    // Remove served IOUs
-    const remainingIOUs = (captainIOUs || []).filter((id) => !picks.includes(id));
-
-    // Step 2: continue from captainIndex round-robin in alphabetical order
-    let idx = captainIndex || 0;
-    let safety = 0;
-    while (picks.length < targetCount && safety < captainQueue.length * 2) {
-      const id = captainQueue[idx % captainQueue.length];
-      if (present.has(id) && !picks.includes(id)) picks.push(id);
-      idx++;
-      safety++;
+    if (picks.length < targetCount) {
+      const remainingPool = presentIds.filter((id) => !picks.includes(id));
+      rngShuffle(remainingPool).forEach((id) => {
+        if (picks.length < targetCount) {
+          picks.push(id);
+        }
+      });
     }
 
     if (!picks.length) return;
 
-    // Apply picks: increment counts, advance index, persist IOUs
     const updated = roster.map((p) => (picks.includes(p.id) ? { ...p, captains: (p.captains || 0) + 1 } : p));
+    const remainingIOUs = (captainIOUs || []).filter((id) => !picks.includes(id));
+
     setState((s) => ({
       ...s,
       roster: updated,
       captainPlan: { ...s.captainPlan, recentPicks: picks },
-      captainIndex: idx % (captainQueue.length || 1),
       captainIOUs: remainingIOUs,
     }));
   }
 
   // ---------- Position assignment engine (random + balanced per game) ----------
   function eligiblePoolForRole(role, candidates, alreadyAssigned, currentSeries) {
-    // Start with players available this series
-    let pool = candidates.filter((id) => !alreadyAssigned.has(id));
-    if (!pool.length) return [];
+    const abilityCheck = ROLE_ABILITY_CHECK[role];
 
-    // Optional: no-repeat same role in last N series
+    const allowed = candidates.filter((id) => {
+      if (alreadyAssigned.has(id)) return false;
+      const player = byId.get(id);
+      if (!player) return false;
+      if (abilityCheck && !abilityCheck(player)) return false;
+      return true;
+    });
+
+    if (!allowed.length) return [];
+    
+    let pool = allowed;
+
+    // Optional: no-repeat same role family in last N series
     if (settings.noRepeatWindow && settings.noRepeatWindow > 0) {
-      pool = pool.filter((id) => {
+      const group = roleGroup(role);
+      const filtered = pool.filter((id) => {
         const rec = recentRoleByPlayer[id];
         if (!rec) return true;
         const within = rec.series >= currentSeries - settings.noRepeatWindow;
-        return !(within && rec.role === role);
+        return !(within && rec.role === group);
       });
-      if (!pool.length) pool = candidates.filter((id) => !alreadyAssigned.has(id));
+      if (filtered.length) {
+        pool = filtered;
+      }
     }
 
     // Prefer players who haven't played this role yet this game
@@ -349,26 +426,20 @@ export default function App() {
 
     const recentUpdate = { ...recentRoleByPlayer };
     const mappingNow = which === 'Offense' ? offense : defense;
-    Object.entries(mappingNow || {}).forEach(([role, pid]) => { recentUpdate[pid] = { role, series: currentSeries }; });
+    Object.entries(mappingNow || {}).forEach(([role, pid]) => {
+      recentUpdate[pid] = { role: roleGroup(role), series: currentSeries };
+    });
 
     const newQueue = [...queue.slice(advance), ...queue.slice(0, advance)];
 
-    setState({
+     setState((s) => ({
+      ...s,
       roster: updatedRoster,
       queue: newQueue,
       series: currentSeries,
-      history: [...history, entry],
-      settings,
+      history: [...s.history, entry],
       recentRoleByPlayer: recentUpdate,
-      captainPlan,
-      captainQueue,
-      captainIndex,
-      captainIOUs,
-      lastQB: null,
-      gameNumber,
-      seasonHistory,
-      ui,
-    });
+      }));
   }
 
   function undo() {
@@ -397,7 +468,7 @@ export default function App() {
       queue: newQueue,
       series: Math.max(0, series - 1),
       history: history.slice(0, -1),
-      recentRoleByPlayer: last.recentBefore || {},
+      recentRoleByPlayer: normalizeRecentMap(last.recentBefore || {}),
     });
   }
 
@@ -481,14 +552,11 @@ export default function App() {
             <div className="text-sm">Used <b>{captainUsed}</b> / Target <b>{captainPlan.seasonTargetTotal}</b> • Rem <b>{captainNeeded}</b></div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <button className="rounded-2xl border border-white/30 hover:border-white/60 bg-white/5 px-4 py-2" onClick={() => pickCaptainsAlphabetical(2)}>Pick 2 (Alphabetical)</button>
+            <button className="rounded-2xl border border-white/30 hover:border-white/60 bg-white/5 px-4 py-2" onClick={() => pickRandomCaptains(2)}>Pick 2 (Random)</button>
             {captainPlan.recentPicks?.length ? (
               <div className="text-sm">Picked: {captainPlan.recentPicks.map((id) => byId.get(id)?.name).filter(Boolean).join(", ")}</div>
             ) : (<div className="text-sm text-gray-300">(no picks yet)</div>)}
-          </div>
-          <div className="mt-3 text-xs text-gray-300">
-            Next up order: {captainQueue.map((id, i) => (i === captainIndex ? `→ ${byId.get(id)?.name}` : byId.get(id)?.name)).join(" · ")}
-          </div>
+          </div>          
         </section>
 
         {/* Tally Board (mobile scroll) */}
@@ -539,11 +607,11 @@ export default function App() {
         <section className="rounded-2xl border border-white/10 bg-white/5 p-3 text-xs text-gray-300">
           <details>
             <summary className="cursor-pointer font-medium">Notes (tap)</summary>
-            <ul className="mt-2 list-disc space-y-1 pl-5">
-              <li>Positions are random-balanced per game: prefer 0-count, otherwise minimum count; tie-break random.</li>
-              <li>Captains are alphabetical with IOUs. Use IOU toggle if someone misses their turn.</li>
-              <li>Start New Game clears **all positions & sits** but keeps captain counts and order.</li>
-            </ul>
+              <ul className="mt-2 list-disc space-y-1 pl-5">
+                <li>Positions are random-balanced per game: prefer 0-count, otherwise minimum count; tie-break random.</li>
+                <li>Captains are random draws with IOUs served first. Use IOU toggle if someone misses their turn.</li>
+                <li>Start New Game clears **all positions & sits** but keeps captain counts.</li>
+              </ul>
           </details>
         </section>
       </main>
@@ -572,14 +640,29 @@ export default function App() {
             </div>
             <div className="p-3 space-y-2 max-h-[70vh] overflow-auto">
               {roster.map((p) => (
-                <div key={p.id} className="flex items-center justify-between rounded-xl bg-white/10 px-3 py-2">
+                 <div key={p.id} className="flex flex-col gap-2 rounded-xl bg-white/10 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
                   <label className="flex items-center gap-3 text-base">
                     <input type="checkbox" className="h-5 w-5" checked={p.active} onChange={() => toggleActive(p.id)} />
                     <span>{p.name}</span>
                   </label>
-                  <div className="flex items-center gap-2 text-xs">
-                    <span>C: {p.captains || 0}</span>
-                    <button className={`rounded-lg border px-2 py-1 ${ (captainIOUs||[]).includes(p.id) ? 'border-white/60 bg-white/20' : 'border-white/30 bg-white/10' }`} onClick={() => toggleCaptainIOU(p.id)} title="Mark captain IOU">IOU</button>
+                  <div className="flex flex-wrap items-center gap-3 text-xs sm:text-sm">
+                    <div className="flex items-center gap-3">
+                      <label className="flex items-center gap-1">
+                        <input type="checkbox" className="h-4 w-4" checked={!!p.canQB} onChange={() => toggleAbilityFlag(p.id, "canQB")} />
+                        <span>QB ok</span>
+                      </label>
+                      <label className="flex items-center gap-1">
+                        <input type="checkbox" className="h-4 w-4" checked={!!p.canCenter} onChange={() => toggleAbilityFlag(p.id, "canCenter")} />
+                        <span>C ok</span>
+                      </label>
+                    </div>
+                    <span>Capt: {p.captains || 0}</span>
+                    <button
+                      className={`rounded-lg border px-2 py-1 ${ (captainIOUs||[]).includes(p.id) ? 'border-white/60 bg-white/20' : 'border-white/30 bg-white/10' }`}
+                      onClick={() => toggleCaptainIOU(p.id)}
+                      title="Mark captain IOU">
+                      IOU
+                    </button>
                     <button className="rounded-lg border border-white/30 bg-white/10 px-2 py-1" onClick={() => removePlayer(p.id)}>remove</button>
                   </div>
                 </div>
