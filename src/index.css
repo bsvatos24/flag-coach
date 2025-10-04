@@ -2,7 +2,14 @@
 
 /* Force dark as the default look */
 @layer base {
+  html {
+    height: 100%;
+    -webkit-text-size-adjust: 100%;
+    background-color: #111827;
+  }
+
   body {
+    min-height: 100%;
     @apply bg-gray-900 text-gray-100;
   }
 }

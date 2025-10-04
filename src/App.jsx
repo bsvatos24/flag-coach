@@ -461,7 +461,7 @@ export default function App() {
     }));
   }
 
-   // ---------- Captains (balanced groups) ----------
+  // ---------- Captains (balanced groups) ----------
   function pickNextCaptains() {
     setState((s) => {
       const activePlayersState = s.roster.filter((p) => p.active);
@@ -481,13 +481,14 @@ export default function App() {
       shuffled.sort((a, b) => {
         const diff = (a.captains || 0) - (b.captains || 0);
         if (diff) return diff;
-        return a.name.localeCompare(b.name);
+        return (tieBreaker.get(a.id) || 0) - (tieBreaker.get(b.id) || 0);
       });
 
       const picks = shuffled.slice(0, targetCount).map((p) => p.id);
+      const tieBreaker = new Map(shuffled.map((player, index) => [player.id, index]));
       if (!picks.length) return s;
 
-    return {
+      return {
         ...s,
         captainPlan: {
           ...s.captainPlan,
