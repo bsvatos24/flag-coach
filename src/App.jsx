@@ -478,14 +478,14 @@ export default function App() {
       if (!targetCount) return s;
 
       const shuffled = rngShuffle(activePlayersState);
+      const tieBreaker = new Map(shuffled.map((player, index) => [player.id, index]));
       shuffled.sort((a, b) => {
         const diff = (a.captains || 0) - (b.captains || 0);
         if (diff) return diff;
         return (tieBreaker.get(a.id) || 0) - (tieBreaker.get(b.id) || 0);
       });
 
-      const picks = shuffled.slice(0, targetCount).map((p) => p.id);
-      const tieBreaker = new Map(shuffled.map((player, index) => [player.id, index]));
+      const picks = shuffled.slice(0, targetCount).map((p) => p.id);      
       if (!picks.length) return s;
 
       return {
