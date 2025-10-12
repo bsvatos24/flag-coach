@@ -289,6 +289,28 @@ export default function App() {
   const totalActive = activePlayers.length;
   const sitCount = Math.max(totalActive - settings.teamSize, 0);
   
+  const isAtticusId = (id) => {
+    const player = byId.get(id);
+    return player?.name?.toLowerCase() === "atticus";
+  };
+
+  function prioritizeAtticus(pool) {
+    if (!pool?.length) return pool;
+    const atticusIds = [];
+    const others = [];
+    pool.forEach((id) => {
+      if (isAtticusId(id)) {
+        atticusIds.push(id);
+      } else {
+        others.push(id);
+      }
+    });
+    if (atticusIds.length) {
+      return [...atticusIds, ...rngShuffle(others)];
+    }
+    return rngShuffle(pool);
+  }
+  
   // Persist
   useEffect(() => {
     localStorage.setItem(LS_KEY, JSON.stringify(state));
