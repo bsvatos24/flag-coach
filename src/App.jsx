@@ -58,6 +58,8 @@ const DEFENSE_LAYOUT = [
 
 const OFFENSE_ROLES = OFFENSE_POSITIONS.map((pos) => pos.key);
 const DEFENSE_ROLES = DEFENSE_POSITIONS.map((pos) => pos.key);
+const OFFENSE_ROLE_SET = new Set(OFFENSE_ROLES);
+const DEFENSE_ROLE_SET = new Set(DEFENSE_ROLES);
 
 const ROLE_META = Object.fromEntries(
   [...OFFENSE_POSITIONS, ...DEFENSE_POSITIONS].map((pos) => [pos.key, pos]),
@@ -85,6 +87,13 @@ const ROLE_ABILITY_CHECK = {
   off_c: (player) => player.canCenter !== false,
 };
 
+const PLAYER_ROLE_RESTRICTIONS = {
+  Atticus: {
+    offense: ["off_te_left", "off_te_right"],
+    defense: ["def_de_left", "def_de_right", "def_dt"],
+  },
+};
+
 function roleGroup(role) {
   if (!role) return role;
   return ROLE_META[role]?.label || role.replace(/\d+$/, "");
@@ -97,8 +106,9 @@ function migrateRoleKey(role) {
 
 const LS_KEY = "ffb-rotation-state-v7";
 const BENCH_PRIORITY_FIRST_OFFENSE = ["Logan L", "Atticus", "Gunnar"];
+const MUST_PLAY_FIRST_DEFENSE = BENCH_PRIORITY_FIRST_OFFENSE;
 const BENCH_NEVER_ALL = ["CJ", "Niko", "Barrett"];
-const DEFAULT_BENCH_META = { firstOffenseHandled: false };
+const DEFAULT_BENCH_META = { firstOffenseHandled: false, firstDefenseHandled: false };
 
 // ---------- Helpers ----------
 function createEmptyTallies(name) {
@@ -396,6 +406,15 @@ export default function App() {
       const player = byId.get(id);
       if (!player) return false;
       if (abilityCheck && !abilityCheck(player)) return false;
+      const restrictions = PLAYER_ROLE_RESTRICTIONS[player.name];
+      if (restrictions) {
+        const scope = OFFENSE_ROLE_SET.has(role)
+          ? restrictions.offense
+          : DEFENSE_ROLE_SET.has(role)
+          ? restrictions.defense
+          : null;
+        if (scope && !scope.includes(role)) return false;
+      }
       return true;
     });
 
@@ -461,6 +480,23 @@ export default function App() {
       nextBenchMeta = { ...benchMetaBefore, firstOffenseHandled: true };
     }
 
+    if (which === "Defense" && !benchMetaBefore.firstDefenseHandled) {
+      const requiredIds = MUST_PLAY_FIRST_DEFENSE
+        .map((name) => findActivePlayerIdByName(roster, name))
+        .filter((id) => id && workingQueue.includes(id));
+      if (requiredIds.length) {
+        const requiredOrdered = [...requiredIds].sort(
+          (a, b) => workingQueue.indexOf(a) - workingQueue.indexOf(b),
+        );
+        const requiredSet = new Set(requiredOrdered);
+        const filteredQueue = workingQueue.filter((id) => !requiredSet.has(id));
+        const benchSlice = filteredQueue.slice(0, sitCount);
+        const playSlice = filteredQueue.slice(sitCount);
+        workingQueue = [...benchSlice, ...requiredOrdered, ...playSlice];
+      }
+      nextBenchMeta = { ...nextBenchMeta, firstDefenseHandled: true };
+    }
+    
     let sitIds = workingQueue.slice(0, sitCount);
     let playIds = workingQueue.slice(sitCount, sitCount + settings.teamSize);
 
@@ -594,7 +630,7 @@ export default function App() {
       </span>
     );
   }
-  function FormationBoard({ title, layout, mapping, action }) {
+  function FormationBoard({ title, layout, mapping, action, sitIds = [], isActive = false }) {
     const columns = layout.reduce((max, row) => Math.max(max, row.length), 0);
     const columnClassMap = {
       1: "grid-cols-1",
@@ -645,6 +681,18 @@ export default function App() {
             </div>
           ))}
         </div>
+        {isActive && (
+          <div className="mt-3 rounded-2xl border border-white/10 bg-white/5 p-3">
+            <div className="mb-2 font-semibold">Sitting this series</div>
+            <div className="flex flex-wrap gap-2">
+              {sitIds.length ? (
+                sitIds.map((id) => <PlayerTag key={id} id={id} />)
+              ) : (
+                <div className="text-sm text-gray-300">(none yet)</div>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -679,6 +727,8 @@ export default function App() {
               title="Offense"
               layout={OFFENSE_LAYOUT}
               mapping={lastEntry?.offense || {}}
+              sitIds={lastEntry?.sitIds || []}
+              isActive={lastEntry?.phase === "Offense"}
               action={(
                 <button
                   type="button"
@@ -693,6 +743,8 @@ export default function App() {
               title="Defense"
               layout={DEFENSE_LAYOUT}
               mapping={lastEntry?.defense || {}}
+              sitIds={lastEntry?.sitIds || []}
+              isActive={lastEntry?.phase === "Defense"}
               action={(
                 <button
                   type="button"
@@ -703,13 +755,6 @@ export default function App() {
                 </button>
               )}
             />
-          </div>
-          <div className="mt-3 rounded-2xl border border-white/10 bg-white/5 p-3">
-            <div className="mb-2 font-semibold">Sitting this series</div>
-            <div className="flex flex-wrap gap-2">
-              {(lastEntry?.sitIds || []).map((id) => (<PlayerTag key={id} id={id} />))}
-              {!(lastEntry?.sitIds || []).length && <div className="text-sm text-gray-300">(none yet)</div>}
-            </div>
           </div>
         </section>
 
