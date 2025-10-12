@@ -310,7 +310,7 @@ export default function App() {
     }
     return rngShuffle(pool);
   }
-  
+
   // Persist
   useEffect(() => {
     localStorage.setItem(LS_KEY, JSON.stringify(state));
@@ -549,9 +549,10 @@ export default function App() {
 
     if (which === "Offense") {
       const mapping = {};
+      const offensePriority = ["off_qb", "off_c", "off_te_left", "off_te_right"];
       const prioritizedRoles = [
-        ...["off_qb", "off_c"].filter((role) => OFFENSE_ROLES.includes(role)),
-        ...OFFENSE_ROLES.filter((role) => role !== "off_qb" && role !== "off_c"),
+        ...offensePriority.filter((role) => OFFENSE_ROLES.includes(role)),
+        ...OFFENSE_ROLES.filter((role) => !offensePriority.includes(role))
       ];
       for (const r of prioritizedRoles) {
         const id = pickForRole(r, playIds, assigned, currentSeries);
@@ -560,7 +561,12 @@ export default function App() {
       offense = mapping;
     } else {
       const mapping = {};
-      for (const r of DEFENSE_ROLES) {
+      const defensePriority = ["def_de_left", "def_dt", "def_de_right"];
+      const prioritizedRoles = [
+        ...defensePriority.filter((role) => DEFENSE_ROLES.includes(role)),
+        ...DEFENSE_ROLES.filter((role) => !defensePriority.includes(role)),
+      ];
+      for (const r of prioritizedRoles) {
         const id = pickForRole(r, playIds, assigned, currentSeries);
         if (id) { mapping[r] = id; assigned.add(id); }
       }
