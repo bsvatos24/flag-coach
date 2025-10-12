@@ -96,22 +96,9 @@ function migrateRoleKey(role) {
 }
 
 const LS_KEY = "ffb-rotation-state-v7";
-const DEFAULT_CAPTAIN_GAMES = 3;
-
-function calculateCaptainGroups(playerCount, gamesRemaining) {
-  const games = Math.max(1, gamesRemaining || DEFAULT_CAPTAIN_GAMES);
-  if (playerCount <= 0) return [];
-  const base = Math.floor(playerCount / games);
-  const remainder = playerCount % games;
-  const groups = new Array(games).fill(base);
-  for (let i = 0; i < remainder; i++) {
-    const idx = groups.length - 1 - i;
-    if (idx >= 0) {
-      groups[idx] += 1;
-    }
-  }
-  return groups.filter((size) => size > 0);
-}
+const BENCH_PRIORITY_FIRST_OFFENSE = ["Logan L", "Atticus", "Gunnar"];
+const BENCH_NEVER_ALL = ["CJ", "Niko", "Barrett"];
+const DEFAULT_BENCH_META = { firstOffenseHandled: false };
 
 // ---------- Helpers ----------
 function createEmptyTallies(name) {
@@ -121,7 +108,6 @@ function createEmptyTallies(name) {
     name,
     active: true,
     sits: 0,
-    captains: 0,
     pos,
     id: crypto.randomUUID(),
     canQB: true,
@@ -137,7 +123,24 @@ function rngShuffle(arr) {
   return a;
 }
 
-// Build a fresh roster: positions zeroed; seed captain counts (season-to-date)
+function buildQueueFromActive(roster, previousQueue = []) {
+  const activeIds = roster.filter((p) => p.active).map((p) => p.id);
+  if (!activeIds.length) return [];
+  const preserved = previousQueue.filter((id) => activeIds.includes(id));
+  if (preserved.length === activeIds.length && preserved.length) {
+    return preserved;
+  }
+  const missing = activeIds.filter((id) => !preserved.includes(id));
+  const shuffledMissing = rngShuffle(missing);
+  return preserved.length ? [...preserved, ...shuffledMissing] : shuffledMissing;
+}
+
+function findActivePlayerIdByName(roster, name) {
+  const target = roster.find((p) => p.active && p.name.toLowerCase() === name.toLowerCase());
+  return target ? target.id : null;
+}
+
+// Build a fresh roster: positions zeroed
 function buildInitialRoster() {
   const roster = DEFAULT_ROSTER.map((n) => createEmptyTallies(n)).sort((a, b) => a.name.localeCompare(b.name));
   return roster;
@@ -165,11 +168,6 @@ function normalizePlayer(player) {
 
   normalized.canQB = player.canQB !== undefined ? player.canQB : true;
   normalized.canCenter = player.canCenter !== undefined ? player.canCenter : true;
-
-  normalized.captains = typeof player.captains === "number" ? player.captains : 0;
-  if (!hadAbilityFlags) {
-    normalized.captains = 0;
-  }
 
   normalized.sits = typeof player.sits === "number" ? player.sits : 0;
   normalized.active = player.active !== undefined ? player.active : true;
@@ -221,18 +219,12 @@ function loadInitialState() {
   };
   const baseState = {
     roster: baseRoster,
-    queue: baseRoster.map((p) => p.id),
+    queue: buildQueueFromActive(baseRoster),
     series: 0,
     history: [],
     settings: baseSettings,
     recentRoleByPlayer: {},
-    captainPlan: {
-      seasonTargetTotal: baseRoster.length * 2,
-      recentPicks: [],
-      pendingPicks: [],
-      gamesRemaining: DEFAULT_CAPTAIN_GAMES,
-      nextGroupIndex: 0,
-    },
+    benchMeta: { ...DEFAULT_BENCH_META },
     lastQB: null,
     gameNumber: 1,
     seasonHistory: [],
@@ -243,37 +235,23 @@ function loadInitialState() {
     const raw = localStorage.getItem(LS_KEY);
     if (raw) {
       const data = JSON.parse(raw);
-      const { captainQueue: _discardQueue, captainIndex: _discardIndex, ...restData } = data || {};
+      const { captainQueue: _discardQueue, captainIndex: _discardIndex, captainPlan: _legacyCaptain, ...restData } = data || {};
       const storedRoster = (restData.roster || []).map((p) => normalizePlayer(p));
       const activeIds = storedRoster.filter((p) => p.active).map((p) => p.id);
       const storedQueue = (restData.queue || []).filter((id) => activeIds.includes(id));
-      const queueTail = activeIds.filter((id) => !storedQueue.includes(id));
       const normalizedRecent = normalizeRecentMap(restData.recentRoleByPlayer);
+      const normalizedRoster = storedRoster.length ? storedRoster : baseRoster;
+      const queueFromStorage = buildQueueFromActive(normalizedRoster, storedQueue);
       return {
         ...baseState,
         ...restData,
-        roster: storedRoster.length ? storedRoster : baseRoster,
-        queue: [...storedQueue, ...queueTail].length ? [...storedQueue, ...queueTail] : baseState.queue,
+        roster: normalizedRoster,
+        queue: queueFromStorage.length ? queueFromStorage : baseState.queue,
         settings: { ...baseSettings, ...(restData.settings || {}) },
-        captainPlan: (() => {
-          const plan = { ...baseState.captainPlan, ...(restData.captainPlan || {}) };
-          plan.seasonTargetTotal = (restData.captainPlan && restData.captainPlan.seasonTargetTotal)
-            || storedRoster.length * 2
-            || baseRoster.length * 2;
-          plan.gamesRemaining = (restData.captainPlan && restData.captainPlan.gamesRemaining !== undefined)
-            ? restData.captainPlan.gamesRemaining
-            : baseState.captainPlan.gamesRemaining;
-          plan.nextGroupIndex = (restData.captainPlan && restData.captainPlan.nextGroupIndex !== undefined)
-            ? restData.captainPlan.nextGroupIndex
-            : 0;
-          const validIds = new Set(storedRoster.map((p) => p.id));
-          plan.recentPicks = (plan.recentPicks || []).filter((id) => validIds.has(id));
-          plan.pendingPicks = (plan.pendingPicks || []).filter((id) => validIds.has(id));
-          return plan;
-        })(),
         history: normalizeHistoryEntries(restData.history || []),
         recentRoleByPlayer: normalizedRecent,
         seasonHistory: restData.seasonHistory || [],
+        benchMeta: restData.benchMeta ? { ...DEFAULT_BENCH_META, ...restData.benchMeta } : baseState.benchMeta,
       };
     }
   } catch {}
@@ -286,7 +264,7 @@ export default function App() {
   const [showTally, setShowTally] = useState(false);
   const {
     roster, queue, series, history, settings, recentRoleByPlayer,
-    captainPlan,
+    benchMeta,
     gameNumber, seasonHistory, ui,
   } = state;
 
@@ -300,19 +278,7 @@ export default function App() {
   const activePlayers = useMemo(() => roster.filter((p) => p.active), [roster]);
   const totalActive = activePlayers.length;
   const sitCount = Math.max(totalActive - settings.teamSize, 0);
-  const captainGroups = useMemo(
-    () => calculateCaptainGroups(totalActive, captainPlan?.gamesRemaining || DEFAULT_CAPTAIN_GAMES),
-    [totalActive, captainPlan?.gamesRemaining],
-  );
-  const nextCaptainGroupSize = captainGroups.length
-    ? captainGroups[Math.min(captainPlan?.nextGroupIndex || 0, captainGroups.length - 1)]
-    : 0;
-  const pendingCaptainIds = captainPlan?.pendingPicks || [];
-  const pendingCaptainSet = new Set(pendingCaptainIds);
-  const canAcceptCaptains = nextCaptainGroupSize > 0 && pendingCaptainIds.length === nextCaptainGroupSize;
-  const pendingCaptainNames = pendingCaptainIds.map((id) => byId.get(id)?.name).filter(Boolean);
-  const recentCaptainNames = (captainPlan?.recentPicks || []).map((id) => byId.get(id)?.name).filter(Boolean);
-
+  
   // Persist
   useEffect(() => {
     localStorage.setItem(LS_KEY, JSON.stringify(state));
@@ -322,27 +288,12 @@ export default function App() {
   useEffect(() => {
     const activeIds = activePlayers.map((p) => p.id);
     const filtered = queue.filter((id) => activeIds.includes(id));
-    const missing = activeIds.filter((id) => !filtered.includes(id));
-    if (filtered.length !== queue.length || missing.length) {
-      setState((s) => ({ ...s, queue: [...filtered, ...missing] }));
+    if (filtered.length !== queue.length || filtered.length !== activeIds.length) {
+      const missing = activeIds.filter((id) => !filtered.includes(id));
+      const updated = missing.length ? [...filtered, ...rngShuffle(missing)] : filtered;
+      setState((s) => ({ ...s, queue: updated }));
     }
   }, [activePlayers, queue]);
-
-  useEffect(() => {
-    if (nextCaptainGroupSize >= 0 && pendingCaptainIds.length > nextCaptainGroupSize) {
-      setState((s) => {
-        const pending = s.captainPlan?.pendingPicks || [];
-        if (pending.length <= nextCaptainGroupSize) return s;
-        return {
-          ...s,
-          captainPlan: {
-            ...s.captainPlan,
-            pendingPicks: pending.slice(0, nextCaptainGroupSize),
-          },
-        };
-      });
-    }
-  }, [nextCaptainGroupSize, pendingCaptainIds.length]);
 
   // ---------- Resets ----------
   function resetPositionsOnly() {
@@ -358,9 +309,9 @@ export default function App() {
       attendance: roster.filter((p) => p.active).map((p) => p.name),
       seriesPlayed: history.length,
     };
-    // Reset sits + ALL per-game position counts to 0; keep captain tallies
+    // Reset sits + ALL per-game position counts to 0
     const base = roster.map((p) => ({ ...p, sits: 0, pos: Object.fromEntries(Object.keys(p.pos).map((k) => [k, 0])) }));
-    const newQueue = base.filter((p) => p.active).map((p) => p.id);
+    const newQueue = buildQueueFromActive(base);
     setState((s) => ({
       ...s,
       roster: base,
@@ -371,7 +322,7 @@ export default function App() {
       lastQB: null,
       gameNumber: (gameNumber || 1) + 1,
       seasonHistory: [...(seasonHistory || []), summary],
-      captainPlan: { ...s.captainPlan, recentPicks: [], pendingPicks: [] },
+      benchMeta: { ...DEFAULT_BENCH_META },
     }));
   }
 
@@ -405,52 +356,27 @@ export default function App() {
     if (!name) return;
     setState((s) => {
       const exists = s.roster.some((p) => p.name.toLowerCase() === name.toLowerCase());
+      if (exists) return s;
       const newPlayer = createEmptyTallies(name);
-      const roster = exists ? s.roster : [...s.roster, newPlayer].sort((a, b) => a.name.localeCompare(b.name));
-      const queue = roster.filter((p) => p.active).map((p) => p.id);
-      const activeCount = roster.filter((p) => p.active).length;
-      const groups = calculateCaptainGroups(activeCount, s.captainPlan?.gamesRemaining || DEFAULT_CAPTAIN_GAMES);
-      const captainPlan = {
-        ...s.captainPlan,
-        seasonTargetTotal: roster.length * 2,
-        nextGroupIndex: Math.min(s.captainPlan?.nextGroupIndex || 0, Math.max(groups.length - 1, 0)),
-      };
-      return { ...s, roster, queue, captainPlan };
+      const roster = [...s.roster, newPlayer].sort((a, b) => a.name.localeCompare(b.name));
+      const queue = buildQueueFromActive(roster, s.queue);
+      return { ...s, roster, queue };
     });
   }
   function removePlayer(id) {
     setState((s) => {
       const roster = s.roster.filter((p) => p.id !== id);
-      const queue = s.queue.filter((q) => q !== id);
-      const activeCount = roster.filter((p) => p.active).length;
-      const groups = calculateCaptainGroups(activeCount, s.captainPlan?.gamesRemaining || DEFAULT_CAPTAIN_GAMES);
-      const captainPlan = {
-        ...s.captainPlan,
-        seasonTargetTotal: roster.length * 2,
-        nextGroupIndex: Math.min(s.captainPlan?.nextGroupIndex || 0, Math.max(groups.length - 1, 0)),
-        recentPicks: (s.captainPlan?.recentPicks || []).filter((pid) => pid !== id),
-        pendingPicks: (s.captainPlan?.pendingPicks || []).filter((pid) => pid !== id),
-      };
+      const filteredQueue = s.queue.filter((q) => q !== id);
+      const queue = buildQueueFromActive(roster, filteredQueue);
       const recentRoleByPlayer = Object.fromEntries(Object.entries(s.recentRoleByPlayer || {}).filter(([pid]) => pid !== id));
-      return { ...s, roster, queue, captainPlan, recentRoleByPlayer };
+      return { ...s, roster, queue, recentRoleByPlayer };
     });
   }
   function toggleActive(id) {
     setState((s) => {
-      const player = s.roster.find((p) => p.id === id);
-      const willBeActive = player ? !player.active : false;
       const roster = s.roster.map((p) => (p.id === id ? { ...p, active: !p.active } : p));
-      const queue = roster.filter((p) => p.active).map((p) => p.id);
-      const activeCount = roster.filter((p) => p.active).length;
-      const groups = calculateCaptainGroups(activeCount, s.captainPlan?.gamesRemaining || DEFAULT_CAPTAIN_GAMES);
-      const captainPlan = {
-        ...s.captainPlan,
-        nextGroupIndex: Math.min(s.captainPlan?.nextGroupIndex || 0, Math.max(groups.length - 1, 0)),
-        pendingPicks: willBeActive
-          ? s.captainPlan?.pendingPicks || []
-          : (s.captainPlan?.pendingPicks || []).filter((pid) => pid !== id),
-      };
-      return { ...s, roster, queue, captainPlan };
+      const queue = buildQueueFromActive(roster, s.queue);
+      return { ...s, roster, queue };
     });
   }
 
@@ -459,138 +385,6 @@ export default function App() {
       ...s,
       roster: s.roster.map((p) => (p.id === id ? { ...p, [key]: !p[key] } : p)),
     }));
-  }
-
-  // ---------- Captains (balanced groups) ----------
-  function pickNextCaptains() {
-    setState((s) => {
-      const activePlayersState = s.roster.filter((p) => p.active);
-      if (!activePlayersState.length) return s;
-
-      const groups = calculateCaptainGroups(
-        activePlayersState.length,
-        s.captainPlan?.gamesRemaining || DEFAULT_CAPTAIN_GAMES,
-      );
-      if (!groups.length) return s;
-
-      const currentIndex = Math.min(s.captainPlan?.nextGroupIndex || 0, groups.length - 1);
-      const targetCount = groups[currentIndex] || 0;
-      if (!targetCount) return s;
-
-      const shuffled = rngShuffle(activePlayersState);
-      const tieBreaker = new Map(shuffled.map((player, index) => [player.id, index]));
-      shuffled.sort((a, b) => {
-        const diff = (a.captains || 0) - (b.captains || 0);
-        if (diff) return diff;
-        return (tieBreaker.get(a.id) || 0) - (tieBreaker.get(b.id) || 0);
-      });
-
-      const picks = shuffled.slice(0, targetCount).map((p) => p.id);      
-      if (!picks.length) return s;
-
-      return {
-        ...s,
-        captainPlan: {
-          ...s.captainPlan,
-          pendingPicks: picks,
-        },
-      };
-    });
-  }
-
-  function clearPendingCaptains() {
-    setState((s) => ({
-      ...s,
-      captainPlan: {
-        ...s.captainPlan,
-        pendingPicks: [],
-      },
-    }));
-  }
-
-  function togglePendingCaptain(id) {
-    setState((s) => {
-      const activePlayersState = s.roster.filter((p) => p.active);
-      if (!activePlayersState.find((p) => p.id === id)) return s;
-
-      const groups = calculateCaptainGroups(
-        activePlayersState.length,
-        s.captainPlan?.gamesRemaining || DEFAULT_CAPTAIN_GAMES,
-      );
-      if (!groups.length) return s;
-
-      const currentIndex = Math.min(s.captainPlan?.nextGroupIndex || 0, groups.length - 1);
-      const targetCount = groups[currentIndex] || 0;
-      if (!targetCount) return s;
-
-      const pending = s.captainPlan?.pendingPicks || [];
-
-      if (pending.includes(id)) {
-        return {
-          ...s,
-          captainPlan: {
-            ...s.captainPlan,
-            pendingPicks: pending.filter((pid) => pid !== id),
-          },
-        };
-      }
-
-      if (pending.length >= targetCount) {
-        return s;
-      }
-
-      return {
-        ...s,
-        captainPlan: {
-          ...s.captainPlan,
-          pendingPicks: [...pending, id],
-        },
-      };
-    });
-  }
-
-  function acceptPendingCaptains() {
-    setState((s) => {
-      const activePlayersState = s.roster.filter((p) => p.active);
-      if (!activePlayersState.length) return s;
-
-      const groups = calculateCaptainGroups(
-        activePlayersState.length,
-        s.captainPlan?.gamesRemaining || DEFAULT_CAPTAIN_GAMES,
-      );
-      if (!groups.length) return s;
-
-      const currentIndex = Math.min(s.captainPlan?.nextGroupIndex || 0, groups.length - 1);
-      const targetCount = groups[currentIndex] || 0;
-      if (!targetCount) return s;
-
-      const activeIdSet = new Set(activePlayersState.map((p) => p.id));
-      const pending = (s.captainPlan?.pendingPicks || []).filter((id) => activeIdSet.has(id));
-      const uniquePending = [...new Set(pending)];
-
-      if (uniquePending.length !== targetCount) {
-        return s;
-      }
-
-      const updatedRoster = s.roster.map((p) => (
-        uniquePending.includes(p.id)
-          ? { ...p, captains: (p.captains || 0) + 1 }
-          : p
-      ));
-
-      const nextIndex = Math.min(currentIndex + 1, Math.max(groups.length - 1, 0));
-
-      return {
-        ...s,
-        roster: updatedRoster,
-        captainPlan: {
-          ...s.captainPlan,
-          recentPicks: uniquePending,
-          pendingPicks: [],
-          nextGroupIndex: nextIndex,
-        },
-      };
-    });
   }
 
   // ---------- Position assignment engine (random + balanced per game) ----------
@@ -648,8 +442,49 @@ export default function App() {
     }
 
     const advance = Math.max(1, sitCount);
-    const sitIds = queue.slice(0, sitCount);
-    const playIds = queue.slice(sitCount, sitCount + settings.teamSize);
+    const benchMetaBefore = benchMeta || DEFAULT_BENCH_META;
+    let nextBenchMeta = benchMetaBefore;
+    let workingQueue = [...queue];
+
+    if (which === "Offense" && !benchMetaBefore.firstOffenseHandled) {
+      if (sitCount > 0) {
+        const priorityIds = BENCH_PRIORITY_FIRST_OFFENSE
+          .map((name) => findActivePlayerIdByName(roster, name))
+          .filter((id) => id && workingQueue.includes(id));
+        if (priorityIds.length) {
+          const seats = Math.min(sitCount, priorityIds.length);
+          const idsToFront = priorityIds.slice(0, seats);
+          const rest = workingQueue.filter((id) => !idsToFront.includes(id));
+          workingQueue = [...idsToFront, ...rest];
+        }
+      }
+      nextBenchMeta = { ...benchMetaBefore, firstOffenseHandled: true };
+    }
+
+    let sitIds = workingQueue.slice(0, sitCount);
+    let playIds = workingQueue.slice(sitCount, sitCount + settings.teamSize);
+
+    if (sitCount > 0) {
+      const avoidIds = BENCH_NEVER_ALL
+        .map((name) => findActivePlayerIdByName(roster, name))
+        .filter((id) => id && workingQueue.includes(id));
+      if (avoidIds.length === BENCH_NEVER_ALL.length && avoidIds.every((id) => sitIds.includes(id))) {
+        const avoidSet = new Set(avoidIds);
+        const swapCandidate = playIds.find((id) => !avoidSet.has(id));
+        if (swapCandidate) {
+          const swapInBench = avoidIds.find((id) => sitIds.includes(id));
+          const benchIndex = workingQueue.indexOf(swapInBench);
+          const playIndex = workingQueue.indexOf(swapCandidate);
+          if (benchIndex >= 0 && playIndex >= 0) {
+            const updatedQueue = [...workingQueue];
+            [updatedQueue[benchIndex], updatedQueue[playIndex]] = [updatedQueue[playIndex], updatedQueue[benchIndex]];
+            workingQueue = updatedQueue;
+            sitIds = workingQueue.slice(0, sitCount);
+            playIds = workingQueue.slice(sitCount, sitCount + settings.teamSize);
+          }
+        }
+      }
+    }
 
     let offense = null, defense = null;
     const assigned = new Set();
@@ -674,7 +509,16 @@ export default function App() {
       defense = mapping;
     }
 
-    const entry = { phase: which, series: currentSeries, sitIds, playIds, offense, defense, recentBefore: recentRoleByPlayer };
+    const entry = {
+      phase: which,
+      series: currentSeries,
+      sitIds,
+      playIds,
+      offense,
+      defense,
+      recentBefore: recentRoleByPlayer,
+      benchMetaBefore,
+    };
 
     const updatedRoster = roster.map((p) => {
       if (sitIds.includes(p.id)) return { ...p, sits: p.sits + 1 };
@@ -690,7 +534,7 @@ export default function App() {
       recentUpdate[pid] = { role: roleGroup(role), series: currentSeries };
     });
 
-    const newQueue = [...queue.slice(advance), ...queue.slice(0, advance)];
+    const newQueue = [...workingQueue.slice(advance), ...workingQueue.slice(0, advance)];
 
      setState((s) => ({
       ...s,
@@ -699,6 +543,7 @@ export default function App() {
       series: currentSeries,
       history: [...s.history, entry],
       recentRoleByPlayer: recentUpdate,
+      benchMeta: nextBenchMeta,
       }));
   }
 
@@ -722,6 +567,10 @@ export default function App() {
     const advance = Math.max(1, Math.max(totalActive - settings.teamSize, 0));
     const newQueue = [...queue.slice(-advance), ...queue.slice(0, -advance)];
 
+    const benchMetaRestored = Object.prototype.hasOwnProperty.call(last, "benchMetaBefore")
+      ? { ...DEFAULT_BENCH_META, ...(last.benchMetaBefore || {}) }
+      : benchMeta;
+
     setState({
       ...state,
       roster: restored,
@@ -729,6 +578,7 @@ export default function App() {
       series: Math.max(0, series - 1),
       history: history.slice(0, -1),
       recentRoleByPlayer: normalizeRecentMap(last.recentBefore || {}),
+      benchMeta: benchMetaRestored,
     });
   }
 
@@ -744,7 +594,7 @@ export default function App() {
       </span>
     );
   }
-  function FormationBoard({ title, layout, mapping }) {
+  function FormationBoard({ title, layout, mapping, action }) {
     const columns = layout.reduce((max, row) => Math.max(max, row.length), 0);
     const columnClassMap = {
       1: "grid-cols-1",
@@ -757,7 +607,10 @@ export default function App() {
 
     return (
       <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
-        <div className="mb-3 font-semibold">{title}</div>
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div className="font-semibold">{title}</div>
+          {action || null}
+        </div>
         <div className="space-y-2">
           {layout.map((row, rowIndex) => (
             <div key={rowIndex} className={`grid gap-2 ${columnClass}`}>
@@ -797,8 +650,6 @@ export default function App() {
   }
 
   const lastEntry = history[history.length - 1];
-  const captainUsed = roster.reduce((sum, p) => sum + (p.captains || 0), 0);
-  const captainNeeded = Math.max(0, (captainPlan.seasonTargetTotal || 0) - captainUsed);
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 mx-auto max-w-6xl pb-28">
@@ -824,8 +675,34 @@ export default function App() {
             <span className="text-sm text-gray-300">{lastEntry ? `${lastEntry.phase} • Series ${lastEntry.series}` : "(none yet)"}</span>
           </div>
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-            <FormationBoard title="Offense" layout={OFFENSE_LAYOUT} mapping={lastEntry?.offense || {}} />
-            <FormationBoard title="Defense" layout={DEFENSE_LAYOUT} mapping={lastEntry?.defense || {}} />
+            <FormationBoard
+              title="Offense"
+              layout={OFFENSE_LAYOUT}
+              mapping={lastEntry?.offense || {}}
+              action={(
+                <button
+                  type="button"
+                  className="rounded-xl border border-white/30 bg-white/5 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-gray-200 hover:border-white/60"
+                  onClick={() => nextSeries('Offense')}
+                >
+                  Run Offense
+                </button>
+              )}
+            />
+            <FormationBoard
+              title="Defense"
+              layout={DEFENSE_LAYOUT}
+              mapping={lastEntry?.defense || {}}
+              action={(
+                <button
+                  type="button"
+                  className="rounded-xl border border-white/30 bg-white/5 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-gray-200 hover:border-white/60"
+                  onClick={() => nextSeries('Defense')}
+                >
+                  Run Defense
+                </button>
+              )}
+            />
           </div>
           <div className="mt-3 rounded-2xl border border-white/10 bg-white/5 p-3">
             <div className="mb-2 font-semibold">Sitting this series</div>
@@ -845,89 +722,6 @@ export default function App() {
           </div>
         </section>
 
-        {/* Captains: Alphabetical Queue */}
-        <section className="rounded-2xl border border-white/10 bg-white/5 p-4">
-          <div className="mb-2 flex items-center justify-between">
-            <h2 className="text-lg font-semibold">Captains</h2>
-            <div className="text-sm">Used <b>{captainUsed}</b> / Target <b>{captainPlan.seasonTargetTotal}</b> • Rem <b>{captainNeeded}</b></div>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              className="rounded-2xl border border-white/30 hover:border-white/60 bg-white/5 px-4 py-2 disabled:opacity-50 disabled:hover:border-white/30"
-              onClick={pickNextCaptains}
-              disabled={!nextCaptainGroupSize}
-            >
-              {nextCaptainGroupSize ? `Pick Next Captains (${nextCaptainGroupSize})` : "Pick Next Captains"}
-            </button>
-            <button
-              className="rounded-2xl border border-emerald-400/40 hover:border-emerald-300 bg-emerald-400/10 px-4 py-2 text-emerald-200 disabled:border-white/20 disabled:bg-transparent disabled:text-gray-400 disabled:hover:border-white/20"
-              onClick={acceptPendingCaptains}
-              disabled={!canAcceptCaptains}
-            >
-              Accept Captains
-            </button>
-            <button
-              className="rounded-2xl border border-white/20 hover:border-white/40 bg-white/5 px-3 py-2 text-sm disabled:opacity-50 disabled:hover:border-white/20"
-              onClick={clearPendingCaptains}
-              disabled={!pendingCaptainIds.length}
-            >
-              Clear Selection
-            </button>
-          </div>
-          <div className="mt-3 space-y-1 text-sm text-gray-200">
-            <div>
-              Next group size: <b>{nextCaptainGroupSize || "--"}</b>
-              {nextCaptainGroupSize ? ` • Selected ${pendingCaptainIds.length}/${nextCaptainGroupSize}` : ""}
-            </div>
-            {pendingCaptainNames.length ? (
-              <div>Pending: {pendingCaptainNames.join(", ")}</div>
-            ) : (
-              <div className="text-gray-400">No captains selected yet.</div>
-            )}
-          </div>
-          <div className="mt-3">
-            <div className="text-xs uppercase tracking-wide text-gray-400">
-              Tap to toggle captains
-            </div>
-            <div className="mt-2 flex flex-wrap gap-2">
-              {activePlayers.length ? (
-                activePlayers.map((p) => {
-                  const isSelected = pendingCaptainSet.has(p.id);
-                  const allowSelection = nextCaptainGroupSize > 0;
-                  const atLimit = !isSelected && pendingCaptainIds.length >= nextCaptainGroupSize && allowSelection;
-                  const disabled = (!allowSelection && !isSelected) || atLimit;
-                  return (
-                    <button
-                      key={p.id}
-                      className={`rounded-xl border px-3 py-2 text-sm transition ${
-                        isSelected
-                          ? "border-emerald-300 bg-emerald-300/20 text-emerald-100"
-                          : disabled
-                            ? "border-white/10 bg-white/5 text-gray-500"
-                            : "border-white/20 bg-white/5 text-gray-200 hover:border-white/40"
-                      }`}
-                      onClick={() => togglePendingCaptain(p.id)}
-                      disabled={disabled}
-                    >
-                      {p.name}
-                    </button>
-                  );
-                })
-              ) : (
-                <div className="text-sm text-gray-400">No active players available.</div>
-              )}
-            </div>
-          </div>
-          <div className="mt-3 space-y-1 text-xs text-gray-300">
-            <div>
-              Last accepted: {recentCaptainNames.length ? recentCaptainNames.join(", ") : "(none)"}
-            </div>
-            <div>
-              Plan: {captainGroups.length ? captainGroups.join(" • ") : "--"} captains over {captainGroups.length || 0} game{captainGroups.length === 1 ? "" : "s"} • Games left setting: {captainPlan.gamesRemaining || DEFAULT_CAPTAIN_GAMES}
-            </div>
-          </div>         
-        </section>
-
         {/* Tally Board (mobile scroll) */}
         <section className="rounded-2xl border border-white/10 bg-white/5 p-3">
           <button
@@ -943,14 +737,12 @@ export default function App() {
                 <thead>
                   <tr className="text-left">
                     <th className="p-2">Player</th>
-                    <th className="p-2 border-l border-white/10">Capt</th>
                     <th className="p-2 border-l border-white/10">Sits</th>
                     <th className="p-2 border-l border-white/10 text-center" colSpan={OFFENSE_ROLES.length}>Offense</th>
                     <th className="p-2 border-l border-white/10 text-center" colSpan={DEFENSE_ROLES.length}>Defense</th>
                   </tr>
                   <tr className="text-left text-[11px] uppercase tracking-wide text-gray-300">
                     <th className="p-2"></th>
-                    <th className="p-2 border-l border-white/10"></th>
                     <th className="p-2 border-l border-white/10"></th>
                     {OFFENSE_ROLES.map((r, idx) => (
                       <th
@@ -976,7 +768,6 @@ export default function App() {
                   {roster.map((p) => (
                     <tr key={p.id} className={!p.active ? "opacity-60" : undefined}>
                       <td className="p-2 whitespace-nowrap">{p.name}</td>
-                      <td className="p-2 border-l border-white/10">{p.captains || 0}</td>
                       <td className="p-2 border-l border-white/10">{p.sits}</td>
                       {OFFENSE_ROLES.map((r, idx) => (
                         <td key={r} className={"p-2" + (idx === 0 ? " border-l border-white/10" : "")}>{p.pos[r]}</td>
@@ -998,8 +789,8 @@ export default function App() {
             <summary className="cursor-pointer font-medium">Notes (tap)</summary>
               <ul className="mt-2 list-disc space-y-1 pl-5">
                 <li>Positions are random-balanced per game: prefer 0-count, otherwise minimum count; tie-break random.</li>
-                <li>Captains are balanced: lowest totals are picked first using the remaining-games plan (3 • 3 • 4 by default).</li>
-                <li>Start New Game clears **all positions & sits** but keeps captain counts.</li>
+                <li>Bench rotation is randomized with first-offense priorities and no triple-sit (CJ, Niko, Barrett).</li>
+                <li>Start New Game clears **all positions & sits**.</li>
               </ul>
           </details>
         </section>
@@ -1007,11 +798,9 @@ export default function App() {
 
       {/* Sticky bottom control bar */}
       <div className="fixed inset-x-0 bottom-0 z-20 bg-gray-900/95 backdrop-blur border-t border-white/10">
-        <div className="mx-auto max-w-6xl px-4 py-3 grid grid-cols-2 gap-3">
-          <button className="h-12 rounded-2xl text-base font-semibold border border-white/30 bg-white/5" onClick={() => nextSeries('Offense')}>Offense</button>
-          <button className="h-12 rounded-2xl text-base font-semibold border border-white/30 bg-white/5" onClick={() => nextSeries('Defense')}>Defense</button>
-          <button className="col-span-2 h-10 rounded-xl text-sm border border-white/20 bg-white/5" onClick={undo} disabled={!history.length}>Undo</button>
-          <div className="col-span-2 grid grid-cols-3 gap-2 text-xs">
+        <div className="mx-auto max-w-6xl px-4 py-3 space-y-3">
+          <button className="w-full h-10 rounded-xl text-sm border border-white/20 bg-white/5" onClick={undo} disabled={!history.length}>Undo</button>
+          <div className="grid grid-cols-3 gap-2 text-xs">
             <button className="rounded-xl border border-white/20 bg-white/5 py-2" onClick={startNewGame}>Start New Game</button>
             <button className="rounded-xl border border-white/20 bg-white/5 py-2" onClick={resetPositionsOnly}>Reset Positions</button>
             <button className="rounded-xl border border-white/20 bg-white/5 py-2" onClick={addPlayer}>Add Player</button>
@@ -1062,8 +851,7 @@ export default function App() {
                         <span className="text-base leading-none">{p.canCenter ? "✓" : "✕"}</span>
                         <span>C</span>
                       </button>
-                    </div>
-                    <span>Capt: {p.captains || 0}</span>                  
+                    </div>               
                     <button className="rounded-lg border border-white/30 bg-white/10 px-2 py-1" onClick={() => removePlayer(p.id)}>remove</button>
                   </div>
                 </div>
@@ -1091,30 +879,6 @@ export default function App() {
                 <span className="text-sm">No repeat same role in last 1 series</span>
                 <input type="checkbox" className="h-5 w-5" checked={!!settings.noRepeatWindow}
                   onChange={()=>setState((s)=>({...s, settings:{...s.settings, noRepeatWindow: s.settings.noRepeatWindow ? 0 : 1}}))} />
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-sm">Captain games remaining</span>
-                <input
-                  type="number"
-                  className="w-20 rounded border border-white/20 bg-transparent px-2 py-1"
-                  value={captainPlan.gamesRemaining || DEFAULT_CAPTAIN_GAMES}
-                  min={1}
-                  onChange={(e) => {
-                    const value = Math.max(1, Math.floor(+e.target.value || DEFAULT_CAPTAIN_GAMES));
-                    setState((s) => {
-                      const activeCount = s.roster.filter((p) => p.active).length;
-                      const groups = calculateCaptainGroups(activeCount, value);
-                      return {
-                        ...s,
-                        captainPlan: {
-                          ...s.captainPlan,
-                          gamesRemaining: value,
-                          nextGroupIndex: Math.min(s.captainPlan?.nextGroupIndex || 0, Math.max(groups.length - 1, 0)),
-                        },
-                      };
-                    });
-                  }}
-                />
               </div>
             </div>
           </div>
