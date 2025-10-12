@@ -294,6 +294,49 @@ export default function App() {
     return player?.name?.toLowerCase() === "atticus";
   };
 
+  function prioritizeRestrictedPlayers(pool, role) {
+    if (!pool?.length) return pool;
+
+    const isOffenseRole = OFFENSE_ROLE_SET.has(role);
+    const relevantRoles = isOffenseRole ? OFFENSE_ROLES : DEFENSE_ROLES;
+    const scopeKey = isOffenseRole ? "offense" : "defense";
+
+    const restricted = [];
+    const unrestricted = [];
+
+    pool.forEach((id) => {
+      const player = byId.get(id);
+      if (!player) return;
+
+      const restrictions = PLAYER_ROLE_RESTRICTIONS[player.name];
+      if (!restrictions) {
+        unrestricted.push(id);
+        return;
+      }
+
+      const allowed = restrictions[scopeKey];
+      if (!Array.isArray(allowed) || !allowed.length) {
+        unrestricted.push(id);
+        return;
+      }
+
+      const allowedSet = new Set(allowed);
+      const allowedRelevantCount = relevantRoles.filter((roleKey) => allowedSet.has(roleKey)).length;
+
+      if (allowedRelevantCount > 0 && allowedRelevantCount < relevantRoles.length) {
+        restricted.push(id);
+      } else {
+        unrestricted.push(id);
+      }
+    });
+
+    if (!restricted.length) {
+      return rngShuffle(pool);
+    }
+
+    return [...rngShuffle(restricted), ...rngShuffle(unrestricted)];
+  }
+
   function prioritizeAtticus(pool) {
     if (!pool?.length) return pool;
     const atticusIds = [];
@@ -460,13 +503,13 @@ export default function App() {
 
     // Prefer players who haven't played this role yet this game
     const zeroPool = pool.filter((id) => byId.get(id).pos[role] === 0);
-    if (zeroPool.length) return rngShuffle(zeroPool);
+    if (zeroPool.length) return prioritizeRestrictedPlayers(zeroPool, role);
 
     // Otherwise, pick from minimum per-game count for this role
     const counts = pool.map((id) => byId.get(id).pos[role]);
     const minCount = Math.min(...counts);
     const minPool = pool.filter((id) => byId.get(id).pos[role] === minCount);
-    return rngShuffle(minPool);
+    return prioritizeRestrictedPlayers(minPool, role);
   }
 
   function pickForRole(role, candidates, alreadyAssigned, currentSeries) {
